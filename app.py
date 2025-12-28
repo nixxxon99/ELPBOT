@@ -1,22 +1,19 @@
 import os
 import logging
-from flask import Flask, request
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import asyncio
 
-# --- 1. Настройка Flask-приложения (ОБЯЗАТЕЛЬНО для Render) ---
-app = Flask(__name__)
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# Токен бота из переменных окружения Render
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-# Секретный ключ для вебхука (можно любой)
-WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'your-secret-token-for-webhook')
+# Токен из переменных окружения Render
+TOKEN = os.environ.get('BOT_TOKEN')
 
-# Глобальная переменная для экземпляра бота
-bot_application = None
-
-# --- 2. База знаний (вопрос-ответ) ---
+# База знаний
 KNOWLEDGE_BASE = {
     "площадь": "🏭 *Евразийский Логистический Парк (ELP)*\n\n• Общая площадь: 250 000 кв. м\n• Корпус А: 32 800 м²\n• Корпус В: 17 500 м²\n• Мин. аренда: от 3 500 м²",
     "стоимость": "💰 *Стоимость аренды*\n\n• От 5 500 ₸ за кв.м/мес (с OPEX)\n• Индивидуальный расчёт у брокера",
@@ -26,126 +23,81 @@ KNOWLEDGE_BASE = {
     "срок": "📅 *Сроки реализации*\n\nПериод реализации проекта: 2025–2028 гг.\nПервый этап (Корпус В) введён в эксплуатацию."
 }
 
-# Функция для создания клавиатуры
-def get_reply_keyboard():
+# Создаем клавиатуру
+from telegram import ReplyKeyboardMarkup
+
+def get_keyboard():
     keyboard = [
         ["📐 Площади", "💰 Стоимость", "📍 Расположение"],
         ["⚙️ Характеристики", "🤝 Брокер", "📅 Сроки"],
         ["🏭 О проекте ELP"]
     ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-# --- 3. Обработчики команд Telegram ---
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Обработчики команд
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
     welcome_text = (
         "🏭 *Добро пожаловать в бот Евразийского Логистического Парка!*\n\n"
         "Я здесь, чтобы ответить на ваши вопросы об аренде складов класса А в Алматы.\n\n"
         "Выберите вопрос из меню ниже или просто напишите его текстом."
     )
-    await update.message.reply_text(welcome_text, 
-                                   parse_mode='Markdown',
-                                   reply_markup=get_reply_keyboard())
+    await update.message.reply_text(
+        welcome_text,
+        parse_mode='Markdown',
+        reply_markup=get_keyboard()
+    )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help"""
-    help_text = (
-        "🤖 *Помощь по боту*\n\n"
-        "• Используйте кнопки меню для быстрых ответов\n"
-        "• Или напишите: 'площадь', 'стоимость', 'расположение', 'характеристики', 'брокер', 'срок'\n"
-        "• Сайт проекта: https://elpk.kz"
+    await update.message.reply_text(
+        "Используйте кнопки меню или напишите: площадь, стоимость, расположение...",
+        reply_markup=get_keyboard()
     )
-    await update.message.reply_text(help_text, parse_mode='Markdown')
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик текстовых сообщений"""
-    user_text = update.message.text.lower()
+    text = update.message.text.lower()
     response = "Выберите вопрос из меню или напишите, например: 'площадь' или 'стоимость'."
     
-    # Проверяем кнопки и текст
-    if any(word in user_text for word in ["площад", "метр"]):
+    if "площад" in text:
         response = KNOWLEDGE_BASE["площадь"]
-    elif any(word in user_text for word in ["стоимост", "цен", "аренд"]):
+    elif "стоимост" in text or "цен" in text:
         response = KNOWLEDGE_BASE["стоимость"]
-    elif any(word in user_text for word in ["расположен", "адрес", "где"]):
+    elif "расположен" in text or "адрес" in text:
         response = KNOWLEDGE_BASE["расположение"]
-    elif any(word in user_text for word in ["характеристик", "технич"]):
+    elif "характеристик" in text:
         response = KNOWLEDGE_BASE["характеристики"]
-    elif any(word in user_text for word in ["брокер", "контакт"]):
+    elif "брокер" in text or "контакт" in text:
         response = KNOWLEDGE_BASE["брокер"]
-    elif any(word in user_text for word in ["срок", "когда", "реализац"]):
+    elif "срок" in text:
         response = KNOWLEDGE_BASE["срок"]
-    elif any(word in user_text for word in ["elp", "проект", "о проект"]):
-        response = "🏭 *Евразийский Логистический Парк (ELP)* — проект строительства современного логистического хаба класса А площадью 250 000 кв.м в Алматы. Цель — создание ключевого узла для оптимизации товаропотоков в Центральной Азии."
+    elif "elp" in text or "проект" in text:
+        response = "🏭 *Евразийский Логистический Парк (ELP)* — проект строительства современного логистического хаба класса А площадью 250 000 кв.м в Алматы."
     
-    await update.message.reply_text(response, 
-                                   parse_mode='Markdown',
-                                   reply_markup=get_reply_keyboard())
+    await update.message.reply_text(
+        response,
+        parse_mode='Markdown',
+        reply_markup=get_keyboard()
+    )
 
-# --- 4. Инициализация и запуск бота (Webhook) ---
-async def setup_bot():
-    """Настройка и запуск бота с использованием webhook"""
-    global bot_application
+def main():
+    """Основная функция запуска бота"""
+    if not TOKEN:
+        logger.error("❌ ОШИБКА: Переменная BOT_TOKEN не установлена в Render!")
+        return
     
-    if not BOT_TOKEN:
-        logging.error("❌ ОШИБКА: Переменная BOT_TOKEN не установлена!")
-        return None
-    
-    # Создаём приложение бота
-    bot_application = Application.builder().token(BOT_TOKEN).build()
+    # Создаем приложение
+    application = Application.builder().token(TOKEN).build()
     
     # Регистрируем обработчики
-    bot_application.add_handler(CommandHandler("start", start_command))
-    bot_application.add_handler(CommandHandler("help", help_command))
-    bot_application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    return bot_application
-
-# --- 5. Маршруты Flask ---
-@app.route('/')
-def home():
-    """Главная страница сервиса (для проверки работы)"""
-    return "✅ Телеграм-бот ELP активен и работает! Бот использует long polling."
-
-@app.route('/set_webhook', methods=['GET'])
-def set_webhook():
-    """Установка вебхука (опционально, для продвинутой настройки)"""
-    # Этот маршрут можно использовать позже для перехода на вебхуки
-    return "Webhook endpoint. Бот сейчас использует long polling."
-
-# --- 6. Запуск приложения ---
-async def main():
-    """Основная асинхронная функция для запуска"""
-    bot_app = await setup_bot()
-    if bot_app:
-        logging.info("🤖 Запускаю Telegram бота...")
-        # ЗАПУСКАЕМ БОТА В РЕЖИМЕ LONG POLLING (самый простой для старта)
-        await bot_app.initialize()
-        await bot_app.start()
-        await bot_app.updater.start_polling()
-        logging.info("✅ Бот успешно запущен и ожидает сообщений...")
-        
-        # Запускаем Flask в отдельном потоке, чтобы он не блокировался
-        # Это критически важно!
-        def run_flask():
-            port = int(os.environ.get('PORT', 5000))
-            app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
-        
-        import threading
-        flask_thread = threading.Thread(target=run_flask, daemon=True)
-        flask_thread.start()
-        
-        # Бесконечно ждём, пока бот работает
-        await bot_app.updater.idle()
-    else:
-        logging.error("Не удалось инициализировать бота. Проверьте BOT_TOKEN.")
+    # Запускаем бота
+    logger.info("🤖 Бот запускается...")
+    application.run_polling()
 
 if __name__ == '__main__':
-    # Настройка логирования
-    logging.basicConfig(
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        level=logging.INFO
-    )
-    
-    # Запускаем основную асинхронную функцию
-    asyncio.run(main())
+    main()
