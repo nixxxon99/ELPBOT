@@ -461,10 +461,14 @@ async def get_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Шаг 4: Подтверждение и отправка"""
-    query = update.callback_query
-    await query.answer()
+    # Проверяем, есть ли query (для callback)
+    query = None
+    if hasattr(update, 'callback_query'):
+        query = update.callback_query
+        if query:
+            await query.answer()
     
-    if query.data == 'back_to_term':
+    if query and query.data == 'back_to_term':
         await query.edit_message_text(
             text="📋 *Оформление заявки*\n\n"
                  f"✅ Площадь: {context.user_data['lead']['area']}\n"
@@ -475,7 +479,7 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return CONTACT
     
-    if query.data in ['send_phone', 'send_email']:
+    if query and query.data in ['send_phone', 'send_email']:
         context.user_data['contact_type'] = 'телефон' if query.data == 'send_phone' else 'email'
         
         await query.edit_message_text(
@@ -504,9 +508,11 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if lead_id:
             lead['db_id'] = lead_id
             lead_id_display = f"#{lead_id}"
+            logger.info(f"✅ Заявка сохранена в БД с ID: {lead_id}")
         else:
             # Резервный вариант, если БД не работает
             lead_id_display = f"lead_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            logger.warning(f"⚠️ Заявка не сохранена в БД, временный ID: {lead_id_display}")
         
         # Формируем сообщение для админа
         admin_message = (
