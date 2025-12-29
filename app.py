@@ -1,7 +1,21 @@
 import os
 import logging
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes, ConversationHandler
+)
+
+# ===== НАСТРОЙКИ =====
+TOKEN = os.environ.get('BOT_TOKEN')
+ADMIN_CHAT_ID = os.environ.get('ADMIN_CHAT_ID', '1294415669')  # Ваш ID в Telegram
+
+# Состояния для ConversationHandler
+AREA, TERM, CONTACT, CONFIRM = range(4)
+
+# База данных (временная, в памяти)
+leads_db = {}
 
 # Настройка логирования
 logging.basicConfig(
@@ -10,93 +24,470 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Токен из переменных окружения Render
-TOKEN = os.environ.get('BOT_TOKEN')
-
-# База знаний
+# ===== БАЗА ЗНАНИЙ ELP =====
 KNOWLEDGE_BASE = {
-    "площадь": "🏭 *Евразийский Логистический Парк (ELP)*\n\n• Общая площадь: 250 000 кв. м\n• Корпус А: 32 800 м²\n• Корпус В: 17 500 м²\n• Мин. аренда: от 3 500 м²",
-    "стоимость": "💰 *Стоимость аренды*\n\n• От 5 500 ₸ за кв.м/мес (с OPEX)\n• Индивидуальный расчёт у брокера",
-    "расположение": "📍 *Расположение*\n\n• Адрес: Алматинская обл., Талгарский р-н, Кульджинский тракт, 200\n• 30 км до центра Алматы\n• 22 км до аэропорта\n• 5 км до развязки БАКАД",
-    "характеристики": "⚙️ *Характеристики складов класса А*\n\n• Высота: 12 м\n• Нагрузка на пол: 8 т/м²\n• Шаг колонн: 12×24 м\n• Автоматические системы пожаротушения",
-    "брокер": "🤝 *Контакты*\n\nЭксклюзивный брокер проекта: **Bright Rich | CORFAC International**\n\nСвяжитесь с ними для получения презентации и КП.",
-    "срок": "📅 *Сроки реализации*\n\nПериод реализации проекта: 2025–2028 гг.\nПервый этап (Корпус В) введён в эксплуатацию."
+    'area': "🏭 *Площади складов ELP:*\n\n"
+            "• Корпус А: 32 800 м²\n"
+            "• Корпус В: 17 500 м²\n"
+            "• Минимальная аренда: от 3 500 м²\n\n"
+            "Все склады класса А с полным комплектом инженерных систем.",
+    
+    'price': "💰 *Стоимость аренды:*\n\n"
+             "• От 5 500 ₸ за кв.м/мес\n"
+             "• Включает OPEX (эксплуатационные расходы)\n"
+             "• Индивидуальный расчёт для площадей от 3 500 м²\n\n"
+             "Есть вопросы по стоимости?",
+    
+    'location': "📍 *Расположение:*\n\n"
+                "• Алматинская область, Талгарский район\n"
+                "• Кульджинский тракт, 200\n"
+                "• 30 км до центра Алматы\n"
+                "• 22 км до международного аэропорта\n"
+                "• 5 км до развязки БАКАД\n\n"
+                "Координаты: 43.394771, 77.173137",
+    
+    'specs': "⚙️ *Технические характеристики:*\n\n"
+             "• Класс А по международной классификации\n"
+             "• Высота до подкранового пути: 12 м\n"
+             "• Допустимая нагрузка на пол: 8 т/м²\n"
+             "• Шаг колонн: 12×24 м\n"
+             "• Доки: 1 на 1200 м²\n"
+             "• Современные системы пожаротушения\n"
+             "• Круглосуточная охрана и видеонаблюдение",
+    
+    'broker': "🤝 *Контакты брокера:*\n\n"
+              "Эксклюзивный брокер проекта:\n"
+              "**Bright Rich | CORFAC International**\n\n"
+              "• ТОП-5 на рынке коммерческой недвижимости РК\n"
+              "• 16 лет опыта, 3 млн м² закрытых сделок\n\n"
+              "Свяжитесь для презентации и КП.",
+    
+    'timeline': "📅 *Сроки реализации:*\n\n"
+                "• Период проекта: 2025–2028 гг.\n"
+                "• 1 этап (Корпус В) — введён в эксплуатацию\n"
+                "• Поэтапный ввод до общей площади 250 000 м²"
 }
 
-# Создаем клавиатуру
-from telegram import ReplyKeyboardMarkup
-
-def get_keyboard():
+# ===== КЛАВИАТУРЫ =====
+def main_menu_keyboard():
+    """Главное меню (inline-кнопки)"""
     keyboard = [
-        ["📐 Площади", "💰 Стоимость", "📍 Расположение"],
-        ["⚙️ Характеристики", "🤝 Брокер", "📅 Сроки"],
-        ["🏭 О проекте ELP"]
+        [InlineKeyboardButton("📐 Площади", callback_data='area'),
+         InlineKeyboardButton("💰 Стоимость", callback_data='price')],
+        [InlineKeyboardButton("📍 Расположение", callback_data='location'),
+         InlineKeyboardButton("⚙️ Характеристики", callback_data='specs')],
+        [InlineKeyboardButton("🤝 Брокер", callback_data='broker'),
+         InlineKeyboardButton("📅 Сроки", callback_data='timeline')],
+        [InlineKeyboardButton("📝 Оставить заявку", callback_data='start_request')]
     ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    return InlineKeyboardMarkup(keyboard)
 
-# Обработчики команд
+def action_keyboard(action_type='default'):
+    """Кнопки действий после ответа"""
+    if action_type == 'price':
+        keyboard = [
+            [InlineKeyboardButton("📞 Позвонить брокеру", callback_data='call_broker'),
+             InlineKeyboardButton("📝 Оставить заявку", callback_data='start_request')],
+            [InlineKeyboardButton("🗓️ Записаться на просмотр", callback_data='schedule_tour')]
+        ]
+    elif action_type == 'broker':
+        keyboard = [
+            [InlineKeyboardButton("📞 Позвонить", callback_data='call_broker'),
+             InlineKeyboardButton("✉️ Написать email", callback_data='write_email')],
+            [InlineKeyboardButton("📝 Оставить заявку", callback_data='start_request')]
+        ]
+    else:
+        keyboard = [
+            [InlineKeyboardButton("📝 Оставить заявку", callback_data='start_request'),
+             InlineKeyboardButton("💰 Узнать стоимость", callback_data='price')],
+            [InlineKeyboardButton("🤝 Связаться с брокером", callback_data='broker')]
+        ]
+    return InlineKeyboardMarkup(keyboard)
+
+def area_selection_keyboard():
+    """Выбор площади для заявки"""
+    keyboard = [
+        [InlineKeyboardButton("до 500 м²", callback_data='area_500')],
+        [InlineKeyboardButton("500 - 1 000 м²", callback_data='area_1000')],
+        [InlineKeyboardButton("1 000 - 3 500 м²", callback_data='area_3500')],
+        [InlineKeyboardButton("более 3 500 м²", callback_data='area_5000')],
+        [InlineKeyboardButton("↩️ Назад", callback_data='cancel')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def term_selection_keyboard():
+    """Выбор срока аренды"""
+    keyboard = [
+        [InlineKeyboardButton("6 месяцев", callback_data='term_6')],
+        [InlineKeyboardButton("1 год", callback_data='term_12')],
+        [InlineKeyboardButton("2 года", callback_data='term_24')],
+        [InlineKeyboardButton("3+ года", callback_data='term_36')],
+        [InlineKeyboardButton("↩️ Назад", callback_data='back_to_area')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# ===== ОСНОВНЫЕ ОБРАБОТЧИКИ =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start"""
+    """Команда /start"""
     welcome_text = (
-        "🏭 *Добро пожаловать в бот Евразийского Логистического Парка!*\n\n"
-        "Я здесь, чтобы ответить на ваши вопросы об аренде складов класса А в Алматы.\n\n"
-        "Выберите вопрос из меню ниже или просто напишите его текстом."
+        "🏭 *Добро пожаловать в официальный бот Евразийского Логистического Парка!*\n\n"
+        "Здесь вы можете получить всю информацию о складах класса А в Алматы.\n\n"
+        "Выберите интересующий раздел:"
     )
-    await update.message.reply_text(
-        welcome_text,
+    
+    if update.message:
+        await update.message.reply_text(
+            welcome_text,
+            parse_mode='Markdown',
+            reply_markup=main_menu_keyboard()
+        )
+    else:
+        await update.callback_query.edit_message_text(
+            welcome_text,
+            parse_mode='Markdown',
+            reply_markup=main_menu_keyboard()
+        )
+    
+    return ConversationHandler.END
+
+async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нажатий в главном меню"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    data = query.data
+    
+    # Сохраняем в историю
+    if 'history' not in context.user_data:
+        context.user_data['history'] = []
+    context.user_data['history'].append({
+        'action': data,
+        'time': datetime.now().isoformat()
+    })
+    
+    # Обработка разных типов кнопок
+    if data in KNOWLEDGE_BASE:
+        # Показываем информацию + кнопки действий
+        action_type = 'price' if data == 'price' else 'broker' if data == 'broker' else 'default'
+        
+        await query.edit_message_text(
+            text=KNOWLEDGE_BASE[data],
+            parse_mode='Markdown',
+            reply_markup=action_keyboard(action_type)
+        )
+    
+    elif data == 'start_request':
+        # Начинаем процесс заявки
+        await query.edit_message_text(
+            text="📋 *Оформление заявки*\n\n"
+                 "Давайте подберём оптимальное решение для вашего бизнеса.\n\n"
+                 "🔄 *Шаг 1 из 4*\n"
+                 "Какая площадь склада вас интересует?",
+            parse_mode='Markdown',
+            reply_markup=area_selection_keyboard()
+        )
+        return AREA
+    
+    elif data == 'call_broker':
+        await query.edit_message_text(
+            text="📞 *Контакты брокера:*\n\n"
+                 "Телефон: +7 (XXX) XXX-XX-XX\n"
+                 "Email: broker@elp.kz\n\n"
+                 "Рабочие часы: Пн-Пт, 9:00-18:00\n\n"
+                 "[Вернуться в меню](/start)",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏠 В главное меню", callback_data='main_menu')
+            ]])
+        )
+    
+    elif data == 'schedule_tour':
+        await query.edit_message_text(
+            text="🗓️ *Запись на просмотр*\n\n"
+                 "Для записи на индивидуальный просмотр:\n"
+                 "1. Оставьте заявку через бота\n"
+                 "2. Наш менеджер свяжется с вами\n"
+                 "3. Согласуем удобное время\n\n"
+                 "Просмотры проводятся по будням с 10:00 до 17:00.",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📝 Оставить заявку", callback_data='start_request'),
+                InlineKeyboardButton("🏠 В меню", callback_data='main_menu')
+            ]])
+        )
+    
+    elif data == 'main_menu':
+        await start(update, context)
+
+# ===== ПРОЦЕСС ЗАЯВКИ =====
+async def select_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 1: Выбор площади"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'cancel':
+        await start(update, context)
+        return ConversationHandler.END
+    
+    # Сохраняем выбор площади
+    area_map = {
+        'area_500': 'до 500 м²',
+        'area_1000': '500 - 1 000 м²',
+        'area_3500': '1 000 - 3 500 м²',
+        'area_5000': 'более 3 500 м²'
+    }
+    
+    context.user_data['lead'] = {
+        'area': area_map.get(query.data, query.data),
+        'user_id': query.from_user.id,
+        'username': query.from_user.username or query.from_user.first_name,
+        'created': datetime.now().isoformat()
+    }
+    
+    await query.edit_message_text(
+        text="📋 *Оформление заявки*\n\n"
+             f"✅ Площадь: {context.user_data['lead']['area']}\n\n"
+             "🔄 *Шаг 2 из 4*\n"
+             "На какой срок планируете аренду?",
         parse_mode='Markdown',
-        reply_markup=get_keyboard()
+        reply_markup=term_selection_keyboard()
     )
+    return TERM
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /help"""
+async def select_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 2: Выбор срока"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'back_to_area':
+        await query.edit_message_text(
+            text="📋 *Оформление заявки*\n\n"
+                 "🔄 *Шаг 1 из 4*\n"
+                 "Какая площадь склада вас интересует?",
+            parse_mode='Markdown',
+            reply_markup=area_selection_keyboard()
+        )
+        return AREA
+    
+    # Сохраняем срок
+    term_map = {
+        'term_6': '6 месяцев',
+        'term_12': '1 год',
+        'term_24': '2 года',
+        'term_36': '3+ года'
+    }
+    
+    context.user_data['lead']['term'] = term_map.get(query.data, query.data)
+    
+    await query.edit_message_text(
+        text="📋 *Оформление заявки*\n\n"
+             f"✅ Площадь: {context.user_data['lead']['area']}\n"
+             f"✅ Срок аренды: {context.user_data['lead']['term']}\n\n"
+             "🔄 *Шаг 3 из 4*\n"
+             "Как к вам обращаться? Отправьте ваше имя.",
+        parse_mode='Markdown'
+    )
+    return CONTACT
+
+async def get_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 3: Получение контакта"""
+    if update.message:
+        context.user_data['lead']['name'] = update.message.text
+        
+        keyboard = [[
+            InlineKeyboardButton("📱 Отправить телефон", callback_data='send_phone'),
+            InlineKeyboardButton("📧 Указать email", callback_data='send_email')
+        ], [
+            InlineKeyboardButton("↩️ Назад", callback_data='back_to_term')
+        ]]
+        
+        await update.message.reply_text(
+            text="📋 *Оформление заявки*\n\n"
+                 f"✅ Площадь: {context.user_data['lead']['area']}\n"
+                 f"✅ Срок: {context.user_data['lead']['term']}\n"
+                 f"✅ Имя: {context.user_data['lead']['name']}\n\n"
+                 "🔄 *Шаг 4 из 4*\n"
+                 "Как с вами связаться?",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return CONFIRM
+
+async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 4: Подтверждение и отправка"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'back_to_term':
+        await query.edit_message_text(
+            text="📋 *Оформление заявки*\n\n"
+                 f"✅ Площадь: {context.user_data['lead']['area']}\n"
+                 f"✅ Срок аренды: {context.user_data['lead']['term']}\n\n"
+                 "🔄 *Шаг 3 из 4*\n"
+                 "Как к вам обращаться? Отправьте ваше имя.",
+            parse_mode='Markdown'
+        )
+        return CONTACT
+    
+    if query.data in ['send_phone', 'send_email']:
+        context.user_data['contact_type'] = 'телефон' if query.data == 'send_phone' else 'email'
+        
+        await query.edit_message_text(
+            text=f"Отправьте ваш {context.user_data['contact_type']}:",
+            parse_mode='Markdown'
+        )
+        return CONFIRM
+    
+    # Если это сообщение с контактом
+    if update.message:
+        if update.message.contact:
+            contact = update.message.contact.phone_number
+            contact_type = 'телефон'
+        else:
+            contact = update.message.text
+            contact_type = context.user_data.get('contact_type', 'контакт')
+        
+        # Сохраняем заявку
+        lead = context.user_data['lead']
+        lead['contact'] = contact
+        lead['contact_type'] = contact_type
+        lead_id = f"lead_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        # Сохраняем в "базу"
+        leads_db[lead_id] = lead
+        
+        # Формируем сообщение для админа
+        admin_message = (
+            "🚀 *НОВАЯ ЗАЯВКА С БОТА ELP!*\n\n"
+            f"📋 ID: `{lead_id}`\n"
+            f"👤 Имя: {lead['name']}\n"
+            f"👤 Username: @{lead['username']}\n"
+            f"📞 Контакт ({lead['contact_type']}): {lead['contact']}\n"
+            f"📐 Площадь: {lead['area']}\n"
+            f"📅 Срок: {lead['term']}\n"
+            f"⏰ Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+            f"User ID: `{lead['user_id']}`"
+        )
+        
+        # Отправляем админу
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=admin_message,
+                parse_mode='Markdown'
+            )
+            logger.info(f"Заявка отправлена админу: {lead_id}")
+        except Exception as e:
+            logger.error(f"Ошибка отправки админу: {e}")
+        
+        # Сообщение пользователю
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📞 Позвонить брокеру", callback_data='call_broker'),
+            InlineKeyboardButton("🏠 В главное меню", callback_data='main_menu')
+        ]])
+        
+        await update.message.reply_text(
+            text="✅ *Заявка успешно отправлена!*\n\n"
+                 "Наш менеджер свяжется с вами в ближайшее время.\n\n"
+                 "📞 Контакты брокера:\n"
+                 "• Телефон: +7 (XXX) XXX-XX-XX\n"
+                 "• Email: broker@elp.kz\n\n"
+                 "Рабочие часы: Пн-Пт, 9:00-18:00",
+            parse_mode='Markdown',
+            reply_markup=keyboard
+        )
+        
+        # Очищаем данные
+        context.user_data.clear()
+        return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена заявки"""
     await update.message.reply_text(
-        "Используйте кнопки меню или напишите: площадь, стоимость, расположение...",
-        reply_markup=get_keyboard()
+        "Заявка отменена.",
+        reply_markup=main_menu_keyboard()
     )
+    context.user_data.clear()
+    return ConversationHandler.END
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик текстовых сообщений"""
+# ===== КОМАНДА АДМИНА =====
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /stats для просмотра статистики"""
+    if str(update.effective_user.id) != ADMIN_CHAT_ID:
+        await update.message.reply_text("⛔ Доступ запрещён")
+        return
+    
+    stats_text = (
+        f"📊 *Статистика бота ELP*\n\n"
+        f"• Всего заявок: {len(leads_db)}\n"
+        f"• За сегодня: {len([l for l in leads_db.values() if l['created'].startswith(datetime.now().strftime('%Y-%m-%d'))])}\n\n"
+        f"Последние 5 заявок:\n"
+    )
+    
+    for i, (lead_id, lead) in enumerate(list(leads_db.items())[-5:], 1):
+        stats_text += f"\n{i}. {lead['name']} - {lead['area']} - {lead['created'][:10]}"
+    
+    await update.message.reply_text(stats_text, parse_mode='Markdown')
+
+# ===== ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ =====
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка текстовых сообщений (не команд)"""
     text = update.message.text.lower()
-    response = "Выберите вопрос из меню или напишите, например: 'площадь' или 'стоимость'."
     
-    if "площад" in text:
-        response = KNOWLEDGE_BASE["площадь"]
-    elif "стоимост" in text or "цен" in text:
-        response = KNOWLEDGE_BASE["стоимость"]
-    elif "расположен" in text or "адрес" in text:
-        response = KNOWLEDGE_BASE["расположение"]
-    elif "характеристик" in text:
-        response = KNOWLEDGE_BASE["характеристики"]
-    elif "брокер" in text or "контакт" in text:
-        response = KNOWLEDGE_BASE["брокер"]
-    elif "срок" in text:
-        response = KNOWLEDGE_BASE["срок"]
-    elif "elp" in text or "проект" in text:
-        response = "🏭 *Евразийский Логистический Парк (ELP)* — проект строительства современного логистического хаба класса А площадью 250 000 кв.м в Алматы."
-    
-    await update.message.reply_text(
-        response,
-        parse_mode='Markdown',
-        reply_markup=get_keyboard()
-    )
+    if any(word in text for word in ['привет', 'здравств', 'hello', 'hi']):
+        await update.message.reply_text(
+            "Привет! Чем могу помочь?",
+            reply_markup=main_menu_keyboard()
+        )
+    elif any(word in text for word in ['спасибо', 'благодар']):
+        await update.message.reply_text("Рад был помочь! 🤝")
+    else:
+        # Если непонятное сообщение — показываем меню
+        await update.message.reply_text(
+            "Выберите интересующий раздел:",
+            reply_markup=main_menu_keyboard()
+        )
 
+# ===== ГЛАВНАЯ ФУНКЦИЯ =====
 def main():
-    """Основная функция запуска бота"""
+    """Запуск бота"""
     if not TOKEN:
-        logger.error("❌ ОШИБКА: Переменная BOT_TOKEN не установлена в Render!")
+        logger.error("❌ Токен бота не найден! Установите BOT_TOKEN в Render")
         return
     
     # Создаем приложение
     application = Application.builder().token(TOKEN).build()
     
+    # ConversationHandler для заявки
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(select_area, pattern='^area_')],
+        states={
+            AREA: [CallbackQueryHandler(select_area)],
+            TERM: [CallbackQueryHandler(select_term)],
+            CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_contact)],
+            CONFIRM: [
+                CallbackQueryHandler(confirm_request),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_request),
+                MessageHandler(filters.CONTACT, confirm_request)
+            ]
+        },
+        fallbacks=[
+            CommandHandler('cancel', cancel),
+            CallbackQueryHandler(start, pattern='^cancel$')
+        ],
+        allow_reentry=True
+    )
+    
     # Регистрируем обработчики
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CommandHandler("stats", admin_stats))
+    application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(handle_menu))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
     # Запускаем бота
-    logger.info("🤖 Бот запускается...")
+    logger.info("🤖 Бот ELP запускается...")
     application.run_polling()
 
 if __name__ == '__main__':
