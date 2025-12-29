@@ -1,5 +1,6 @@
 import os
 import logging
+import psycopg2
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -9,13 +10,11 @@ from telegram.ext import (
 
 # ===== НАСТРОЙКИ =====
 TOKEN = os.environ.get('BOT_TOKEN')
-ADMIN_CHAT_ID = os.environ.get('ADMIN_CHAT_ID', '1294415669')  # Ваш ID в Telegram
+ADMIN_CHAT_ID = os.environ.get('ADMIN_CHAT_ID', '1294415669')
+DATABASE_URL = os.environ.get('DATABASE_URL')  # PostgreSQL URL из Render
 
 # Состояния для ConversationHandler
 AREA, TERM, CONTACT, CONFIRM = range(4)
-
-# База данных (временная, в памяти)
-leads_db = {}
 
 # Настройка логирования
 logging.basicConfig(
@@ -24,7 +23,146 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ===== БАЗА ЗНАНИЙ ELP =====
+# ===== ФУНКЦИИ БАЗЫ ДАННЫХ =====
+def init_db():
+    """Инициализация таблиц в PostgreSQL"""
+    if not DATABASE_URL:
+        logger.warning("⚠️ DATABASE_URL не настроен, используется память")
+        return
+    
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cursor = conn.cursor()
+        
+        # Таблица заявок
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS leads (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                username VARCHAR(100),
+                name VARCHAR(100),
+                contact VARCHAR(100),
+                contact_type VARCHAR(20),
+                area VARCHAR(50),
+                term VARCHAR(50),
+                status VARCHAR(20) DEFAULT 'new',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                notes TEXT
+            )
+        ''')
+        
+        # Таблица активности (для аналитики)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_activity (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                action VARCHAR(50),
+                details TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        logger.info("✅ База данных PostgreSQL инициализирована")
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации БД: {e}")
+
+def save_lead_to_db(lead_data):
+    """Сохранение заявки в PostgreSQL"""
+    if not DATABASE_URL:
+        logger.warning("⚠️ БД не настроена, заявка сохраняется только в памяти")
+        return None
+    
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO leads (user_id, username, name, contact, contact_type, area, term, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        ''', (
+            lead_data['user_id'],
+            lead_data.get('username', ''),
+            lead_data['name'],
+            lead_data['contact'],
+            lead_data['contact_type'],
+            lead_data['area'],
+            lead_data['term'],
+            'new'
+        ))
+        
+        lead_id = cursor.fetchone()[0]
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        logger.info(f"✅ Заявка #{lead_id} сохранена в PostgreSQL")
+        return lead_id
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения в БД: {e}")
+        return None
+
+def get_db_stats():
+    """Получение статистики из PostgreSQL"""
+    if not DATABASE_URL:
+        return {'total': 0, 'today': 0, 'new': 0, 'contacted': 0}
+    
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT 
+                COUNT(*) as total_leads,
+                COUNT(CASE WHEN created_at::date = CURRENT_DATE THEN 1 END) as today_leads,
+                COUNT(CASE WHEN status = 'new' THEN 1 END) as new_leads,
+                COUNT(CASE WHEN status = 'contacted' THEN 1 END) as contacted_leads
+            FROM leads
+        ''')
+        
+        stats = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        return {
+            'total': stats[0] or 0,
+            'today': stats[1] or 0,
+            'new': stats[2] or 0,
+            'contacted': stats[3] or 0
+        }
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения статистики: {e}")
+        return {'total': 0, 'today': 0, 'new': 0, 'contacted': 0}
+
+def get_recent_leads(limit=5):
+    """Получение последних заявок"""
+    if not DATABASE_URL:
+        return []
+    
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT id, name, contact, area, term, created_at
+            FROM leads 
+            ORDER BY created_at DESC 
+            LIMIT %s
+        ''', (limit,))
+        
+        leads = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        return leads
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения заявок: {e}")
+        return []
+
+# ===== БАЗА ЗНАНИЙ ELP (обновленные тексты) =====
 KNOWLEDGE_BASE = {
     'area': "🏭 *Площади складов ELP:*\n\n"
             "• Корпус А: 32 800 м²\n"
@@ -36,7 +174,7 @@ KNOWLEDGE_BASE = {
              "• От 5 500 ₸ за кв.м/мес\n"
              "• Включает OPEX (эксплуатационные расходы)\n"
              "• Индивидуальный расчёт для площадей от 3 500 м²\n\n"
-             "Есть вопросы по стоимости?",
+             "Нужен точный расчёт для вашего бизнеса?",
     
     'location': "📍 *Расположение:*\n\n"
                 "• Алматинская область, Талгарский район\n"
@@ -55,12 +193,11 @@ KNOWLEDGE_BASE = {
              "• Современные системы пожаротушения\n"
              "• Круглосуточная охрана и видеонаблюдение",
     
-    'broker': "🤝 *Контакты брокера:*\n\n"
-              "Эксклюзивный брокер проекта:\n"
-              "**Bright Rich | CORFAC International**\n\n"
-              "• ТОП-5 на рынке коммерческой недвижимости РК\n"
-              "• 16 лет опыта, 3 млн м² закрытых сделок\n\n"
-              "Свяжитесь для презентации и КП.",
+    'contact': "👨‍💼 *Контакты директора по развитию:*\n\n"
+               "**Директор по развитию ELP**\n"
+               "• Email: strategy.elp@gmail.com\n"
+               "• Telegram: @elp_almaty_bot\n\n"
+               "Специализируется на стратегическом развитии логистических мощностей в Алматы.",
     
     'timeline': "📅 *Сроки реализации:*\n\n"
                 "• Период проекта: 2025–2028 гг.\n"
@@ -76,7 +213,7 @@ def main_menu_keyboard():
          InlineKeyboardButton("💰 Стоимость", callback_data='price')],
         [InlineKeyboardButton("📍 Расположение", callback_data='location'),
          InlineKeyboardButton("⚙️ Характеристики", callback_data='specs')],
-        [InlineKeyboardButton("🤝 Брокер", callback_data='broker'),
+        [InlineKeyboardButton("👨‍💼 Контакты", callback_data='contact'),
          InlineKeyboardButton("📅 Сроки", callback_data='timeline')],
         [InlineKeyboardButton("📝 Оставить заявку", callback_data='start_request')]
     ]
@@ -86,21 +223,21 @@ def action_keyboard(action_type='default'):
     """Кнопки действий после ответа"""
     if action_type == 'price':
         keyboard = [
-            [InlineKeyboardButton("📞 Позвонить брокеру", callback_data='call_broker'),
-             InlineKeyboardButton("📝 Оставить заявку", callback_data='start_request')],
+            [InlineKeyboardButton("📝 Оставить заявку", callback_data='start_request'),
+             InlineKeyboardButton("👨‍💼 Написать директору", callback_data='contact')],
             [InlineKeyboardButton("🗓️ Записаться на просмотр", callback_data='schedule_tour')]
         ]
-    elif action_type == 'broker':
+    elif action_type == 'contact':
         keyboard = [
-            [InlineKeyboardButton("📞 Позвонить", callback_data='call_broker'),
-             InlineKeyboardButton("✉️ Написать email", callback_data='write_email')],
-            [InlineKeyboardButton("📝 Оставить заявку", callback_data='start_request')]
+            [InlineKeyboardButton("✉️ Написать email", callback_data='write_email'),
+             InlineKeyboardButton("📝 Оставить заявку", callback_data='start_request')],
+            [InlineKeyboardButton("🏭 Посмотреть площади", callback_data='area')]
         ]
     else:
         keyboard = [
             [InlineKeyboardButton("📝 Оставить заявку", callback_data='start_request'),
              InlineKeyboardButton("💰 Узнать стоимость", callback_data='price')],
-            [InlineKeyboardButton("🤝 Связаться с брокером", callback_data='broker')]
+            [InlineKeyboardButton("👨‍💼 Связаться с директором", callback_data='contact')]
         ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -158,18 +295,25 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = query.data
     
-    # Сохраняем в историю
-    if 'history' not in context.user_data:
-        context.user_data['history'] = []
-    context.user_data['history'].append({
-        'action': data,
-        'time': datetime.now().isoformat()
-    })
+    # Сохраняем активность в БД (если настроена)
+    if DATABASE_URL:
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO user_activity (user_id, action) VALUES (%s, %s)",
+                (user_id, data)
+            )
+            conn.commit()
+            cursor.close()
+            conn.close()
+        except Exception as e:
+            logger.error(f"⚠️ Не удалось сохранить активность: {e}")
     
     # Обработка разных типов кнопок
     if data in KNOWLEDGE_BASE:
         # Показываем информацию + кнопки действий
-        action_type = 'price' if data == 'price' else 'broker' if data == 'broker' else 'default'
+        action_type = 'price' if data == 'price' else 'contact' if data == 'contact' else 'default'
         
         await query.edit_message_text(
             text=KNOWLEDGE_BASE[data],
@@ -189,15 +333,16 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return AREA
     
-    elif data == 'call_broker':
+    elif data == 'write_email':
         await query.edit_message_text(
-            text="📞 *Контакты брокера:*\n\n"
-                 "Телефон: +7 (XXX) XXX-XX-XX\n"
-                 "Email: broker@elp.kz\n\n"
-                 "Рабочие часы: Пн-Пт, 9:00-18:00\n\n"
-                 "[Вернуться в меню](/start)",
+            text="✉️ *Написать директору по развитию:*\n\n"
+                 "Email: strategy.elp@gmail.com\n\n"
+                 "Укажите в теме письма:\n"
+                 "«Запрос по складам ELP»\n\n"
+                 "Мы ответим в течение 24 часов.",
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📝 Оставить заявку через бота", callback_data='start_request'),
                 InlineKeyboardButton("🏠 В главное меню", callback_data='main_menu')
             ]])
         )
@@ -207,7 +352,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="🗓️ *Запись на просмотр*\n\n"
                  "Для записи на индивидуальный просмотр:\n"
                  "1. Оставьте заявку через бота\n"
-                 "2. Наш менеджер свяжется с вами\n"
+                 "2. Директор по развитию свяжется с вами\n"
                  "3. Согласуем удобное время\n\n"
                  "Просмотры проводятся по будням с 10:00 до 17:00.",
             parse_mode='Markdown',
@@ -352,15 +497,21 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lead = context.user_data['lead']
         lead['contact'] = contact
         lead['contact_type'] = contact_type
-        lead_id = f"lead_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
-        # Сохраняем в "базу"
-        leads_db[lead_id] = lead
+        # Сохраняем в PostgreSQL
+        lead_id = save_lead_to_db(lead)
+        
+        if lead_id:
+            lead['db_id'] = lead_id
+            lead_id_display = f"#{lead_id}"
+        else:
+            # Резервный вариант, если БД не работает
+            lead_id_display = f"lead_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         # Формируем сообщение для админа
         admin_message = (
             "🚀 *НОВАЯ ЗАЯВКА С БОТА ELP!*\n\n"
-            f"📋 ID: `{lead_id}`\n"
+            f"📋 ID: `{lead_id_display}`\n"
             f"👤 Имя: {lead['name']}\n"
             f"👤 Username: @{lead['username']}\n"
             f"📞 Контакт ({lead['contact_type']}): {lead['contact']}\n"
@@ -377,22 +528,22 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=admin_message,
                 parse_mode='Markdown'
             )
-            logger.info(f"Заявка отправлена админу: {lead_id}")
+            logger.info(f"Заявка отправлена админу: {lead_id_display}")
         except Exception as e:
             logger.error(f"Ошибка отправки админу: {e}")
         
         # Сообщение пользователю
         keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("📞 Позвонить брокеру", callback_data='call_broker'),
+            InlineKeyboardButton("👨‍💼 Написать директору", callback_data='contact'),
             InlineKeyboardButton("🏠 В главное меню", callback_data='main_menu')
         ]])
         
         await update.message.reply_text(
             text="✅ *Заявка успешно отправлена!*\n\n"
-                 "Наш менеджер свяжется с вами в ближайшее время.\n\n"
-                 "📞 Контакты брокера:\n"
-                 "• Телефон: +7 (XXX) XXX-XX-XX\n"
-                 "• Email: broker@elp.kz\n\n"
+                 "С вами свяжется **директор по развитию ELP** в ближайшее время.\n\n"
+                 "✉️ Контакты для связи:\n"
+                 "• Email: strategy.elp@gmail.com\n"
+                 "• Telegram: @elp_almaty_bot\n\n"
                  "Рабочие часы: Пн-Пт, 9:00-18:00",
             parse_mode='Markdown',
             reply_markup=keyboard
@@ -411,24 +562,58 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
-# ===== КОМАНДА АДМИНА =====
+# ===== КОМАНДЫ АДМИНА =====
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /stats для просмотра статистики"""
     if str(update.effective_user.id) != ADMIN_CHAT_ID:
         await update.message.reply_text("⛔ Доступ запрещён")
         return
     
+    stats = get_db_stats()
+    recent_leads = get_recent_leads(5)
+    
     stats_text = (
         f"📊 *Статистика бота ELP*\n\n"
-        f"• Всего заявок: {len(leads_db)}\n"
-        f"• За сегодня: {len([l for l in leads_db.values() if l['created'].startswith(datetime.now().strftime('%Y-%m-%d'))])}\n\n"
-        f"Последние 5 заявок:\n"
+        f"• Всего заявок: {stats['total']}\n"
+        f"• За сегодня: {stats['today']}\n"
+        f"• Новые: {stats['new']}\n"
+        f"• В работе: {stats['contacted']}\n\n"
     )
     
-    for i, (lead_id, lead) in enumerate(list(leads_db.items())[-5:], 1):
-        stats_text += f"\n{i}. {lead['name']} - {lead['area']} - {lead['created'][:10]}"
+    if recent_leads:
+        stats_text += "📋 *Последние заявки:*\n"
+        for i, (lead_id, name, contact, area, term, created_at) in enumerate(recent_leads, 1):
+            date_str = created_at.strftime('%d.%m') if isinstance(created_at, datetime) else created_at[:10]
+            stats_text += f"\n{i}. {name} - {area} ({date_str})"
+    else:
+        stats_text += "📭 Заявок пока нет"
+    
+    stats_text += "\n\n📈 *База данных:* " + ("✅ Активна" if DATABASE_URL else "⚠️ В памяти")
     
     await update.message.reply_text(stats_text, parse_mode='Markdown')
+
+async def admin_leads(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /leads для детального просмотра"""
+    if str(update.effective_user.id) != ADMIN_CHAT_ID:
+        return
+    
+    recent_leads = get_recent_leads(10)
+    
+    if not recent_leads:
+        await update.message.reply_text("📭 Заявок пока нет")
+        return
+    
+    for i, (lead_id, name, contact, area, term, created_at) in enumerate(recent_leads, 1):
+        date_str = created_at.strftime('%d.%m.%Y %H:%M') if isinstance(created_at, datetime) else created_at
+        lead_text = (
+            f"📋 *Заявка #{lead_id}*\n\n"
+            f"👤 Имя: {name}\n"
+            f"📞 Контакт: {contact}\n"
+            f"📐 Площадь: {area}\n"
+            f"📅 Срок: {term}\n"
+            f"⏰ Дата: {date_str}"
+        )
+        await update.message.reply_text(lead_text, parse_mode='Markdown')
 
 # ===== ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ =====
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -456,6 +641,9 @@ def main():
         logger.error("❌ Токен бота не найден! Установите BOT_TOKEN в Render")
         return
     
+    # Инициализируем БД при запуске
+    init_db()
+    
     # Создаем приложение
     application = Application.builder().token(TOKEN).build()
     
@@ -482,6 +670,7 @@ def main():
     # Регистрируем обработчики
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", admin_stats))
+    application.add_handler(CommandHandler("leads", admin_leads))
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(handle_menu))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
